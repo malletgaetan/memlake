@@ -1,26 +1,4 @@
-#include <stdint.h>
-#include <stddef.h>
-#include <assert.h>
-#include <stdlib.h>
-
-// TODO: make stack grow upward for better cache locality in early allocations
-// TODO: Add possibility of padding the elements in mem[]
-
-typedef struct {
-	size_t   element_size_in_bytes;
-	uint16_t sp;
-	uint16_t stack[UINT16_MAX + 1];
-	uint8_t  mem[];
-} MemoryPool;
-
-typedef struct {
-	size_t     num_pools;
-	size_t     num_allocated;
-	size_t     element_size_in_bytes;
-	uint16_t   sp;
-	uint16_t   stack[4096];
-	MemoryPool *pools[4096];
-} MemoryLake;
+#include "memlake.h"
 
 static inline size_t _pool_size_in_bytes(size_t element_size_in_bytes)
 {
@@ -29,46 +7,58 @@ static inline size_t _pool_size_in_bytes(size_t element_size_in_bytes)
 
 static void _mempool_init(MemoryPool *pool, size_t element_size_in_bytes)
 {
-	for (size_t i = 0; i <= UINT16_MAX; i++) {
-		pool->stack[i] = (uint16_t)i;
+	const int vector_width = 16;
+	__m256i increment = _mm256_set1_epi16(vector_width);
+
+#if defined(__AVX2__)
+	__m256i current = _mm256_set_epi16(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+
+	for (size_t i = 0; i <= UINT16_MAX; i += vector_width) {
+		_mm256_storeu_si256((__m256i *)&pool->stack[i], current);
+		current = _mm256_add_epi16(current, increment);
 	}
-	pool->sp = UINT16_MAX;
+#else
+	uint16_t free = 0;
+	for (size_t i = 0; i <= UINT16_MAX; i++) {
+		pool->stack[i] = free++;
+	}
+#endif
+	pool->sp = 0;
 	pool->element_size_in_bytes = element_size_in_bytes;
+	pool->next = NULL;
 }
 
-// 0x7ffff7c4803a
 static void *_mempool_alloc(MemoryPool *pool)
 {
-	if (pool->sp == 0)
+	if (pool->sp > UINT16_MAX)
 		return NULL;
 
-	size_t offset = pool->stack[pool->sp--] * pool->element_size_in_bytes;
-	void *ptr = (void *)&(pool->mem[pool->stack[pool->sp--] * pool->element_size_in_bytes]);
-	return ptr;
+	size_t offset = pool->stack[pool->sp++] * pool->element_size_in_bytes;
+	return (void *)&(pool->mem[offset]);
 }
 
 static void _mempool_free(MemoryPool *pool)
 {
-	return ;
+	return;
 }
 
 static void _memlake_init(MemoryLake *lake, MemoryPool *first_pool, size_t element_size_in_bytes)
 {
-	lake->sp = 1;
-	lake->stack[1] = 0;
-	lake->pools[0] = first_pool;
 	lake->element_size_in_bytes = element_size_in_bytes;
 	lake->num_pools = 1;
 	lake->num_allocated = 0;
+	lake->free_pool_list = first_pool;
+	lake->full_pool_list = NULL;
 }
 
-static void _memlake_add_pool(MemoryLake *lake)
+static void _memlake_add_pool(MemoryPool **next_ptr, size_t element_size_in_bytes)
 {
-	size_t pool_size_in_bytes = _pool_size_in_bytes(lake->element_size_in_bytes);
+	size_t pool_size_in_bytes = _pool_size_in_bytes(element_size_in_bytes);
 
 	MemoryPool *pool = (MemoryPool *)malloc(pool_size_in_bytes);
 	assert(pool != NULL); // TODO hmh
-	_mempool_init(pool, lake->element_size_in_bytes);
+	_mempool_init(pool, element_size_in_bytes);
+	*next_ptr = pool;
 }
 
 MemoryLake *memlake_create(size_t element_size_in_bytes)
@@ -88,54 +78,63 @@ MemoryLake *memlake_create(size_t element_size_in_bytes)
 
 void memlake_destroy(MemoryLake *lake)
 {
-	return ;
+	return;
 }
 
 void *memlake_alloc(MemoryLake *lake)
 {
 	void *ptr = NULL;
+	MemoryPool *pool = lake->free_pool_list;
+	MemoryPool *next_free;
 	do {
-		MemoryPool *pool = lake->pools[lake->stack[lake->sp]];
 		ptr = _mempool_alloc(pool);
-		if (ptr == NULL) {
-			lake->sp--;
-			if (lake->sp == 0) _memlake_add_pool(lake);
-			continue ;
+		if (ptr != NULL)
+			return ptr;
+
+		// put the pool in the full list
+		next_free = pool->next;
+		pool->next = lake->full_pool_list;
+		lake->full_pool_list = pool;
+
+		// if no free pool left, allocate a new pool
+		if (next_free == NULL) {
+			_memlake_add_pool(&next_free, lake->element_size_in_bytes);
+			lake->free_pool_list = next_free;
 		}
-		return ptr;
+		pool = next_free;
 	} while (1);
 }
 
 void memlake_free(MemoryLake *lake, void *ptr)
 {
-	return ;
+	return;
 }
 
-
 #if defined(TEST) | defined(BENCH)
-# include <sys/sysinfo.h>
-# include <time.h>
-# include <stdio.h>
+#include <stdio.h>
+#include <sys/sysinfo.h>
+#include <time.h>
 
-# define NUM_ALLOC 1000000
+#define NUM_ALLOC 10000000
 
 typedef struct {
 	float x;
 	float y;
 } Coordinates;
 
-void time_me(char identifier[], void(*fn)(void))
+void time_me(char identifier[], void (*fn)(void))
 {
-    struct timespec start, end;
-    double time_taken;
+	struct timespec start, end;
+	double time_taken;
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
+	clock_gettime(CLOCK_MONOTONIC, &start);
 	fn();
-    clock_gettime(CLOCK_MONOTONIC, &end);
+	clock_gettime(CLOCK_MONOTONIC, &end);
 
-    time_taken = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	time_taken = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-    printf("[%s] Time taken to allocate %lu objects: %f seconds\n", identifier, NUM_ALLOC, time_taken);
+	printf("[%s] Time taken to allocate %lu objects: %f seconds\n", identifier, NUM_ALLOC,
+		   time_taken);
 }
 
 void lot_of_alloc_memlake(void)

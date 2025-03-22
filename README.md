@@ -1,18 +1,29 @@
 # memlake
 
-My experiments with building fast object allocator.
+My experiments with different allocating strategies, in this case, fast object allocation / slow deallocation for fixed size object by leveraging SIMD instructions.
 
-## Run it
+## Try it
 
 Benchmark
-```console
->$ gcc -BENCH=1 memlake.c -O3 && ./a.out
-[memlake] Time taken to allocate 1000000 objects: 0.000560 seconds
-[malloc] Time taken to allocate 1000000 objects: 0.018569 seconds
+```sh
+$ ./bench.sh # Run on my 14600k ~20x
+[memlake] Time taken to allocate 10000000 objects: 0.006171 seconds
+[malloc] Time taken to allocate 10000000 objects: 0.146438 seconds
 ```
 
 Test
 ```sh
-gcc -DTEST=1 memlake.c -O3
-./a.out | uniq | wc -l # should be equal to NUM_ALLOC
+$ ./test.sh
+Expected count (NUM_ALLOC): 10000000
+Actual count: 10000000
+SUCCESS: The counts match!
+```
+
+## API
+
+```c
+MemoryLake *memlake_create(size_t element_size_in_bytes);
+void memlake_destroy(MemoryLake *lake); // nope
+void *memlake_alloc(MemoryLake *lake);
+void memlake_free(MemoryLake *lake, void *ptr); // nope
 ```
